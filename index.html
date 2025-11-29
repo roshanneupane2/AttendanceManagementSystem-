@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attendance Management System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // Import necessary Firebase functions
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        // NOTE: Auth imports are still needed if the app runs in the real environment
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, updateDoc, arrayUnion, runTransaction, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase Configuration Fallback ---
+        const DUMMY_FIREBASE_CONFIG = { apiKey: "dummy-key", authDomain: "dummy-domain", projectId: "dummy-project" };
+        
+        // IMPORTANT: Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-attendance-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : DUMMY_FIREBASE_CONFIG; // Use dummy config if not provided
+            
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+        let userRole = null;
+        let userData = null;
+        
+        // --- Data Definitions & Initial Mock Data ---
+        
+        // Base paths for public data collections (for shared multi-user data)
+        const USERS_COLLECTION = `artifacts/${appId}/public/data/users`;
+        const CLASSES_COLLECTION = `artifacts/${appId}/public/data/classes`;
+        const ATTENDANCE_COLLECTION = `artifacts/${appId}/public/data/attendance`;
+
+        // Mock data to ensure the demo works initially
+        const MOCK_CLASSES = [
+            { id: 'cs101', name: 'Computer Science 101', teacherId: 'teacher1', students: ['student1', 'student2', 'student3'] },
+            { id: 'ma202', name: 'Advanced Calculus', teacherId: 'teacher2', students: ['student1', 'student4'] },
+        ];
+
+        const MOCK_USERS = [
+            { id: 'admin1', name: 'System Admin', role: 'admin', classId: null },
+            { id: 'teacher1', name: 'Dr. Evelyn Reed (CS)', role: 'teacher', classId: 'cs101' },
+            { id: 'teacher2', name: 'Prof. Mark Vella (Math)', role: 'teacher', classId: 'ma202' },
+            { id: 'student1', name: 'Alice Smith (CS & Math)', role: 'student', classId: ['cs101', 'ma202'] },
+            { id: 'student2', name: 'Bob Johnson (CS)', role: 'student', classId: ['cs101'] },
+            { id: 'student3', name: 'Charlie Brown (CS)', role: 'student', classId: ['cs101'] },
+            { id: 'student4', name: 'Dana Scully (Math)', role: 'student', classId: ['ma202'] },
+        ];
+        
+        // Mock Attendance Data for Local Preview
+        let MOCK_ATTENDANCE_DATA = [
+            { id: 'cs101_2025-11-28', classId: 'cs101', date: '2025-11-28', records: [
+                { studentId: 'student1', present: true }, 
+                { studentId: 'student2', present: false }, 
+                { studentId: 'student3', present: true }
+            ]},
+            { id: 'ma202_2025-11-29', classId: 'ma202', date: '2025-11-29', records: [
+                { studentId: 'student1', present: true }, 
+                { studentId: 'student4', present: true }
+            ]},
+        ];
+
+        // --- Utility Functions ---
+
+        /** Displays a message in the main content area. */
+        function displayMessage(message, isError = false) {
+            const container = document.getElementById('app-container');
+            container.innerHTML = `
+                <div class="p-6 md:p-10 w-full max-w-lg mx-auto mt-10 rounded-xl shadow-2xl ${isError ? 'bg-red-50 border border-red-400' : 'bg-blue-50 border border-blue-400'}">
+                    <p class="text-xl font-semibold ${isError ? 'text-red-800' : 'text-blue-800'}">${message}</p>
+                    <p class="text-sm mt-2 text-gray-600">User ID: ${userId || 'N/A'}</p>
+                </div>
+            `;
+        }
+        
+        function showCustomAlert(message) {
+             const container = document.getElementById('app-container');
+             const alertBox = document.createElement('div');
+             alertBox.className = 'fixed inset-0 flex items-center justify-center bg-black bg-opacity-50 z-[100]';
+             alertBox.innerHTML = `
+                 <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm">
+                     <p class="text-lg font-semibold text-gray-800 mb-4">${message}</p>
+                     <button onclick="this.closest('.fixed').remove()" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded-lg">Close</button>
+                 </div>
+             `;
+             container.appendChild(alertBox);
+        }
+
+        /** Formats a date object to YYYY-MM-DD string */
+        function formatDate(date) {
+            const d = new Date(date);
+            let month = '' + (d.getMonth() + 1);
+            let day = '' + d.getDate();
+            const year = d.getFullYear();
+
+            if (month.length < 2) 
+                month = '0' + month;
+            if (day.length < 2) 
+                day = '0' + day;
+
+            return [year, month, day].join('-');
+        }
+        
+        // --- Firebase Initialization and Authentication ---
+
+        async function initFirebase() {
+            setLogLevel('debug'); // Enable detailed Firestore logs
+            
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                
+                // --- FIX: Check if we are running with the dummy config (Local Preview Mode) ---
+                if (firebaseConfig === DUMMY_FIREBASE_CONFIG) {
+                    console.warn("Using DUMMY config. Bypassing Auth/Firestore access and setting default user state for local preview.");
+                    
+                    // Set mock user ID (can be customized for testing different roles)
+                    userId = 'local-preview-teacher'; 
+                    //userId = 'local-preview-student'; 
+                    document.getElementById('footer-user-id').textContent = userId;
+                    
+                    // Determine role based on mock ID
+                    let mockRole = 'student';
+                    if (userId.includes('teacher')) mockRole = 'teacher';
+                    else if (userId.includes('admin')) mockRole = 'admin';
+                    
+                    userData = { 
+                        id: userId, 
+                        name: `Mock ${mockRole.charAt(0).toUpperCase() + mockRole.slice(1)}`, 
+                        role: mockRole, 
+                        classId: mockRole === 'teacher' ? 'cs101' : mockRole === 'student' ? ['cs101', 'ma202'] : null 
+                    };
+                    userRole = mockRole;
+                    
+                    // No need to call ensureUserDataExists or initializeMockClasses as we use in-memory MOCK_USERS/MOCK_CLASSES
+                    renderUI(userRole);
+                    return; // EXIT HERE for DUMMY MODE
+                }
+                // --- End FIX block ---
+
+                // REAL FIREBASE CONNECTION below this line
+                auth = getAuth(app);
+                
+                // Sign in using the custom token or anonymously if not available
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Wait for auth state to be resolved
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('footer-user-id').textContent = userId; 
+                        await ensureUserDataExists(userId);
+                    } else {
+                        displayMessage('Authentication failed. Please check environment variables.', true);
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                displayMessage(`System Error during startup: ${error.message}. If you see an 'api-key-not-valid' error, ensure you are running in the correct environment.`, true);
+            }
+        }
+
+        /** Ensures the current user has a role and name in the 'users' collection. (Real DB only) */
+        async function ensureUserDataExists(currentUserId) {
+            // This function is only called in REAL DB mode
+            
+            const userRef = doc(db, USERS_COLLECTION, currentUserId);
+            const docSnap = await getDoc(userRef);
+
+            if (docSnap.exists()) {
+                userData = docSnap.data();
+                userRole = userData.role;
+                renderUI(userRole);
+                return;
+            }
+
+            // --- USER DOES NOT EXIST: Assign a role for demo purposes (on the real DB) ---
+            let newUserRole = 'student';
+            let newUserName = 'New Student User';
+            
+            const uidSuffix = currentUserId.slice(-4); 
+
+            if (uidSuffix.includes('1')) {
+                newUserRole = 'teacher';
+                newUserName = 'Demo Teacher';
+            } else if (uidSuffix.includes('2')) {
+                newUserRole = 'admin';
+                newUserName = 'Demo Admin';
+            }
+
+            userData = {
+                id: currentUserId,
+                name: newUserName,
+                role: newUserRole,
+                classId: newUserRole === 'teacher' ? 'cs101' : newUserRole === 'student' ? ['cs101', 'ma202'] : null,
+                createdAt: new Date(),
+            };
+            
+            await setDoc(userRef, userData);
+            userRole = newUserRole;
+
+            await initializeMockClasses();
+            
+            renderUI(userRole);
+        }
+
+        /** Populates mock classes if they don't exist (Real DB only) */
+        async function initializeMockClasses() {
+            // This function is only called in REAL DB mode
+            const mockUserCheckRef = doc(db, USERS_COLLECTION, MOCK_USERS[0].id);
+            const mockUserCheckSnap = await getDoc(mockUserCheckRef);
+
+            if (mockUserCheckSnap.exists()) return;
+            
+            for (const mockClass of MOCK_CLASSES) {
+                await setDoc(doc(db, CLASSES_COLLECTION, mockClass.id), mockClass);
+            }
+            for (const mockUser of MOCK_USERS) {
+                await setDoc(doc(db, USERS_COLLECTION, mockUser.id), mockUser);
+            }
+            console.log("Mock data initialized on Firestore.");
+        }
+        
+        // --- Core Application Views and Logic ---
+
+        let currentClassStudents = [];
+        let allAttendanceRecords = MOCK_ATTENDANCE_DATA; // Initialize with mock data for local fallback
+
+        // ------------------ TEACHER VIEW ------------------
+
+        function renderTeacherUI() {
+            const classId = Array.isArray(userData.classId) ? userData.classId[0] : userData.classId;
+            if (!classId) {
+                displayMessage('You are a Teacher but not assigned to any class data. Please contact Admin.', true);
+                return;
+            }
+
+            const container = document.getElementById('app-container');
+            container.className = "p-4 md:p-8 space-y-6 w-full max-w-4xl mx-auto";
+            container.innerHTML = `
+                <div id="teacher-header" class="bg-indigo-600 text-white p-5 rounded-xl shadow-lg">
+                    <h2 class="text-2xl font-bold">Teacher Dashboard</h2>
+                    <p class="text-indigo-200">Class: <span id="class-name-display">${classId.toUpperCase()}</span></p>
+                    <p class="text-sm mt-1">Logged in as: ${userData.name} (ID: ${userId})</p>
+                </div>
+
+                <!-- Attendance Marker -->
+                <div class="bg-white p-6 rounded-xl shadow-xl space-y-4">
+                    <h3 class="text-xl font-semibold text-gray-700 border-b pb-2">Mark Attendance</h3>
+                    <div class="flex flex-col sm:flex-row gap-4">
+                        <input type="date" id="attendance-date" class="p-2 border border-gray-300 rounded-lg flex-grow focus:ring-indigo-500 focus:border-indigo-500" value="${formatDate(new Date())}">
+                        <button id="load-attendance-btn" class="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg transition duration-200">
+                            Load/Start Marking
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Student List for Marking -->
+                <div id="student-list-container" class="bg-white p-6 rounded-xl shadow-xl">
+                    <p class="text-gray-500">Select a date and click 'Load/Start Marking' to begin.</p>
+                </div>
+                
+                <div id="status-message" class="text-center p-3 text-sm hidden rounded-lg"></div>
+            `;
+
+            document.getElementById('load-attendance-btn').addEventListener('click', () => loadAttendanceForDate(classId));
+            
+            // Handle student roster loading based on environment
+            if (firebaseConfig !== DUMMY_FIREBASE_CONFIG) {
+                listenToClassData(classId);
+            } else {
+                 // DUMMY MODE: Use in-memory mock data
+                const classData = MOCK_CLASSES.find(c => c.id === classId);
+                if (classData) {
+                    // Filter mock users to get the students in the class
+                    currentClassStudents = MOCK_USERS.filter(u => classData.students.includes(u.id));
+                    document.getElementById('class-name-display').textContent = classData.name;
+                    // Auto-load attendance (which will also use mock data)
+                    document.getElementById('load-attendance-btn').click(); 
+                }
+            }
+        }
+
+        // Listener for real Firebase environment
+        function listenToClassData(classId) {
+            const classRef = doc(db, CLASSES_COLLECTION, classId);
+            onSnapshot(classRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    currentClassStudents = MOCK_USERS.filter(u => data.students.includes(u.id)); // Using MOCK_USERS as a lookup for student names
+                    document.getElementById('class-name-display').textContent = data.name;
+                    document.getElementById('load-attendance-btn').click(); 
+                } else {
+                    displayMessage(`Class ${classId} not found.`, true);
+                }
+            }, (error) => {
+                console.error("Error listening to class data:", error);
+                document.getElementById('student-list-container').innerHTML = `<p class="text-red-600">Error fetching class roster: ${error.message}</p>`;
+            });
+        }
+
+        async function loadAttendanceForDate(classId) {
+            const date = document.getElementById('attendance-date').value;
+            const docId = `${classId}_${date}`;
+            
+            const listContainer = document.getElementById('student-list-container');
+            listContainer.innerHTML = '<div class="text-center p-4"><div class="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600 inline-block"></div> Loading attendance...</div>';
+
+            if (firebaseConfig === DUMMY_FIREBASE_CONFIG) {
+                // DUMMY MODE: Look up attendance in in-memory array
+                const mockDoc = MOCK_ATTENDANCE_DATA.find(d => d.id === docId);
+                let records = mockDoc ? mockDoc.records : [];
+                renderAttendanceMarking(classId, date, records);
+                return;
+            }
+
+            try {
+                const attRef = doc(db, ATTENDANCE_COLLECTION, docId);
+                const docSnap = await getDoc(attRef);
+                let records = docSnap.exists() ? docSnap.data().records : [];
+                
+                renderAttendanceMarking(classId, date, records);
+
+            } catch (error) {
+                console.error("Error loading attendance:", error);
+                listContainer.innerHTML = `<p class="text-red-600">Error loading attendance: ${error.message}</p>`;
+            }
+        }
+        
+        function renderAttendanceMarking(classId, date, records) {
+            const listContainer = document.getElementById('student-list-container');
+            listContainer.innerHTML = `
+                <h4 class="text-lg font-semibold mb-4">Students for ${classId.toUpperCase()} on ${date}</h4>
+                <div class="space-y-3 max-h-96 overflow-y-auto">
+                    ${currentClassStudents.map(student => {
+                        const record = records.find(r => r.studentId === student.id);
+                        // If record exists, use its status; otherwise, default to Present for marking
+                        const isPresent = record ? record.present : true; 
+                        return `
+                            <div class="flex items-center justify-between p-3 bg-gray-50 rounded-lg border">
+                                <span class="font-medium text-gray-700">${student.name} (${student.id})</span>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" data-student-id="${student.id}" class="sr-only peer" ${isPresent ? 'checked' : ''}>
+                                    <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-300 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-indigo-600"></div>
+                                    <span class="ms-3 text-sm font-medium text-gray-900">${isPresent ? 'Present' : 'Absent'}</span>
+                                </label>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+                <button id="save-attendance-btn" class="mt-6 w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-4 rounded-lg transition duration-200 shadow-md">
+                    Save Attendance for ${date}
+                </button>
+            `;
+
+            document.getElementById('save-attendance-btn').addEventListener('click', () => saveAttendance(classId, date));
+            
+            // Add event listener to update label text on toggle
+            listContainer.querySelectorAll('input[type="checkbox"]').forEach(checkbox => {
+                // Initial update of text
+                const labelSpan = checkbox.closest('label').querySelector('.ms-3');
+                labelSpan.textContent = checkbox.checked ? 'Present' : 'Absent';
+                
+                checkbox.addEventListener('change', (e) => {
+                    labelSpan.textContent = e.target.checked ? 'Present' : 'Absent';
+                });
+            });
+        }
+        
+        async function saveAttendance(classId, date) {
+            const docId = `${classId}_${date}`;
+            const statusMessage = document.getElementById('status-message');
+            
+            statusMessage.classList.remove('hidden', 'bg-red-100', 'text-red-800', 'bg-green-100', 'text-green-800');
+            statusMessage.textContent = 'Saving...';
+            statusMessage.classList.add('bg-blue-100', 'text-blue-800');
+
+            const newRecords = [];
+            document.querySelectorAll('#student-list-container input[type="checkbox"]').forEach(checkbox => {
+                newRecords.push({
+                    studentId: checkbox.dataset.studentId,
+                    present: checkbox.checked,
+                    markedBy: userId,
+                    timestamp: new Date().toISOString()
+                });
+            });
+
+            if (firebaseConfig === DUMMY_FIREBASE_CONFIG) {
+                // DUMMY MODE: Update in-memory data
+                const existingIndex = MOCK_ATTENDANCE_DATA.findIndex(d => d.id === docId);
+                const mockDoc = { id: docId, classId: classId, date: date, records: newRecords };
+                
+                if (existingIndex !== -1) {
+                    MOCK_ATTENDANCE_DATA[existingIndex] = mockDoc;
+                } else {
+                    MOCK_ATTENDANCE_DATA.push(mockDoc);
+                }
+                
+                statusMessage.textContent = `[DUMMY MODE] Attendance successfully saved for ${date}! (Data not persistent)`;
+                statusMessage.classList.remove('bg-blue-100', 'text-blue-800');
+                statusMessage.classList.add('bg-green-100', 'text-green-800');
+                return;
+            }
+
+
+            // REAL DB WRITE
+            try {
+                const attRef = doc(db, ATTENDANCE_COLLECTION, docId);
+                await setDoc(attRef, {
+                    classId: classId,
+                    date: date,
+                    records: newRecords,
+                    updatedAt: new Date().toISOString()
+                }, { merge: true });
+
+                statusMessage.textContent = `Attendance successfully saved for ${date}!`;
+                statusMessage.classList.remove('bg-blue-100', 'text-blue-800');
+                statusMessage.classList.add('bg-green-100', 'text-green-800');
+
+            } catch (error) {
+                console.error("Error saving attendance:", error);
+                statusMessage.textContent = `Error saving attendance: ${error.message}`;
+                statusMessage.classList.remove('bg-blue-100', 'text-blue-800');
+                statusMessage.classList.add('bg-red-100', 'text-red-800');
+            }
+            statusMessage.classList.remove('hidden');
+        }
+
+        // ------------------ STUDENT VIEW ------------------
+        
+        function renderStudentUI() {
+            const container = document.getElementById('app-container');
+            container.className = "p-4 md:p-8 space-y-6 w-full max-w-4xl mx-auto";
+            container.innerHTML = `
+                <div class="bg-indigo-600 text-white p-5 rounded-xl shadow-lg">
+                    <h2 class="text-2xl font-bold">Student Dashboard</h2>
+                    <p class="text-indigo-200">Welcome, ${userData.name}</p>
+                    <p class="text-sm mt-1">Logged in as: ${userData.name} (ID: ${userId})</p>
+                </div>
+                
+                <div id="attendance-summary" class="grid md:grid-cols-2 gap-6">
+                    <!-- Attendance cards will be rendered here -->
+                </div>
+
+                <div class="bg-white p-6 rounded-xl shadow-xl">
+                    <h3 class="text-xl font-semibold text-gray-700 border-b pb-2 mb-4">Detailed Attendance History</h3>
+                    <div id="history-table-container" class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead>
+                                <tr class="bg-gray-50">
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Course</th>
+                                    <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="history-table-body" class="bg-white divide-y divide-gray-200">
+                                <!-- History rows will be inserted here -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+            
+            // Handle attendance data loading based on environment
+            if (firebaseConfig !== DUMMY_FIREBASE_CONFIG) {
+                listenToAllAttendance();
+            } else {
+                // DUMMY MODE: Use in-memory mock data
+                allAttendanceRecords = MOCK_ATTENDANCE_DATA; 
+                calculateAndRenderStudentSummary();
+            }
+        }
+
+        // Listener for real Firebase environment
+        function listenToAllAttendance() {
+            const attQuery = collection(db, ATTENDANCE_COLLECTION);
+            
+            onSnapshot(attQuery, (snapshot) => {
+                allAttendanceRecords = [];
+                snapshot.forEach(doc => {
+                    allAttendanceRecords.push(doc.data());
+                });
+                calculateAndRenderStudentSummary();
+            }, (error) => {
+                console.error("Error listening to attendance:", error);
+                document.getElementById('attendance-summary').innerHTML = '<p class="text-red-600">Error loading data.</p>';
+            });
+        }
+        
+        function calculateAndRenderStudentSummary() {
+            const studentId = userId;
+            const enrolledClassIds = userData.classId || [];
+            const summary = {};
+            const history = [];
+
+            // Initialize summary for enrolled classes
+            enrolledClassIds.forEach(classId => {
+                summary[classId] = { totalClasses: 0, presentCount: 0, name: classId.toUpperCase() };
+            });
+
+            allAttendanceRecords.forEach(attDoc => {
+                const classId = attDoc.classId;
+                
+                // Only process attendance for classes the student is enrolled in
+                if (summary[classId]) {
+                    attDoc.records.forEach(record => {
+                        // In DUMMY MODE, we need to map the generic MOCK_ATTENDANCE_DATA to the 'local-preview-student' ID for calculation
+                        const effectiveStudentId = firebaseConfig === DUMMY_FIREBASE_CONFIG ? (record.studentId || 'student1') : studentId; 
+                        
+                        if (record.studentId === effectiveStudentId) {
+                            summary[classId].totalClasses++;
+                            if (record.present) {
+                                summary[classId].presentCount++;
+                            }
+
+                            // Add to history
+                            history.push({
+                                date: attDoc.date,
+                                classId: classId,
+                                status: record.present ? 'Present' : 'Absent'
+                            });
+                        }
+                    });
+                }
+            });
+
+            // Render Summary Cards
+            const summaryContainer = document.getElementById('attendance-summary');
+            if (summaryContainer) {
+                 summaryContainer.innerHTML = Object.keys(summary).map(classId => {
+                    const data = summary[classId];
+                    const percentage = data.totalClasses > 0 
+                        ? ((data.presentCount / data.totalClasses) * 100).toFixed(1) 
+                        : 'N/A';
+                    
+                    const isAtRisk = data.totalClasses > 0 && parseFloat(percentage) < 75;
+                    const cardColor = isAtRisk ? 'bg-red-50 border-red-400' : 'bg-green-50 border-green-400';
+                    const textColor = isAtRisk ? 'text-red-600' : 'text-green-600';
+                    const statusText = data.totalClasses > 0 ? (isAtRisk ? 'At Risk' : 'Satisfactory') : 'No Data';
+
+                    return `
+                        <div class="p-5 rounded-xl shadow-md ${cardColor} border">
+                            <h4 class="text-lg font-semibold text-gray-800">${data.name}</h4>
+                            <p class="text-sm text-gray-600">Total Classes: ${data.totalClasses}</p>
+                            <p class="text-sm text-gray-600">Present Count: ${data.presentCount}</p>
+                            <div class="mt-3 text-3xl font-bold ${textColor}">${percentage}${data.totalClasses > 0 ? '%' : ''}</div>
+                            <div class="text-xs font-semibold mt-1 p-1 inline-block rounded ${isAtRisk ? 'bg-red-200 text-red-800' : 'bg-green-200 text-green-800'}">${statusText}</div>
+                        </div>
+                    `;
+                }).join('');
+            }
+           
+            // Render History Table
+            const tableBody = document.getElementById('history-table-body');
+            if (tableBody) {
+                history.sort((a, b) => new Date(b.date) - new Date(a.date)); // Sort by newest first
+                tableBody.innerHTML = history.map(item => `
+                    <tr>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${item.date}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">${item.classId.toUpperCase()}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-center text-sm">
+                            <span class="p-1 inline-block rounded-full w-3 h-3 ${item.status === 'Present' ? 'bg-green-500' : 'bg-red-500'}"></span>
+                            <span class="ml-2 ${item.status === 'Present' ? 'text-green-600' : 'text-red-600'}">${item.status}</span>
+                        </td>
+                    </tr>
+                `).join('');
+            }
+        }
+
+        // ------------------ ADMIN VIEW ------------------
+
+        function renderAdminUI() {
+            const container = document.getElementById('app-container');
+            container.className = "p-4 md:p-8 space-y-6 w-full max-w-4xl mx-auto";
+            container.innerHTML = `
+                <div class="bg-gray-800 text-white p-5 rounded-xl shadow-lg">
+                    <h2 class="text-2xl font-bold">Admin Dashboard</h2>
+                    <p class="text-gray-400">System Overview and Configuration</p>
+                    <p class="text-sm mt-1">Logged in as: ${userData.name} (ID: ${userId})</p>
+                </div>
+                
+                <div class="grid md:grid-cols-2 gap-6">
+                    <div class="bg-white p-6 rounded-xl shadow-xl">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-3">System Data Snapshots</h3>
+                        <p class="text-gray-500 mb-4">View key data collections in real-time. ${firebaseConfig === DUMMY_FIREBASE_CONFIG ? '(DISABLED IN LOCAL PREVIEW MODE)' : ''}</p>
+                        <div class="space-y-3">
+                            <button data-target="users" class="admin-data-btn w-full text-left bg-indigo-100 hover:bg-indigo-200 text-indigo-800 font-medium py-2 px-4 rounded-lg transition duration-200">View All Users (${USERS_COLLECTION.split('/').pop()})</button>
+                            <button data-target="classes" class="admin-data-btn w-full text-left bg-indigo-100 hover:bg-indigo-200 text-indigo-800 font-medium py-2 px-4 rounded-lg transition duration-200">View All Classes (${CLASSES_COLLECTION.split('/').pop()})</button>
+                            <button data-target="attendance" class="admin-data-btn w-full text-left bg-indigo-100 hover:bg-indigo-200 text-indigo-800 font-medium py-2 px-4 rounded-lg transition duration-200">View All Attendance Records (${ATTENDANCE_COLLECTION.split('/').pop()})</button>
+                        </div>
+                    </div>
+                    <div class="bg-white p-6 rounded-xl shadow-xl">
+                        <h3 class="text-xl font-semibold text-gray-700 mb-3">Live System Metrics</h3>
+                        <div id="metric-users" class="p-3 bg-blue-50 rounded-lg mb-2">Total Users: <span class="font-bold text-blue-700">...</span></div>
+                        <div id="metric-classes" class="p-3 bg-blue-50 rounded-lg mb-2">Total Classes: <span class="font-bold text-blue-700">...</span></div>
+                        <div id="metric-attendance" class="p-3 bg-blue-50 rounded-lg">Attendance Docs: <span class="font-bold text-blue-700">...</span></div>
+                    </div>
+                </div>
+
+                <!-- Data Display Modal -->
+                <div id="data-display" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto z-50">
+                    <div class="relative top-1/2 mx-auto p-5 border w-11/12 md:w-3/4 shadow-lg rounded-xl bg-white transform -translate-y-1/2">
+                        <div class="flex justify-between items-center border-b pb-3 mb-4">
+                            <h4 id="data-title" class="text-lg font-bold"></h4>
+                            <button id="close-modal-btn" class="text-gray-500 hover:text-gray-800">&times;</button>
+                        </div>
+                        <pre id="data-content" class="bg-gray-100 p-4 rounded-lg overflow-x-auto text-sm max-h-96"></pre>
+                    </div>
+                </div>
+            `;
+            
+            if (firebaseConfig !== DUMMY_FIREBASE_CONFIG) {
+                listenToAdminMetrics();
+                document.querySelectorAll('.admin-data-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => showDataModal(e.target.dataset.target));
+                });
+            } else {
+                // Mock metrics for DUMMY mode
+                document.getElementById('metric-users').querySelector('span').textContent = MOCK_USERS.length + 1;
+                document.getElementById('metric-classes').querySelector('span').textContent = MOCK_CLASSES.length;
+                document.getElementById('metric-attendance').querySelector('span').textContent = MOCK_ATTENDANCE_DATA.length;
+                
+                document.querySelectorAll('.admin-data-btn').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        showCustomAlert('Admin features requiring Firestore access are disabled in local preview mode.');
+                    });
+                });
+            }
+
+            document.getElementById('close-modal-btn')?.addEventListener('click', () => {
+                document.getElementById('data-display').classList.add('hidden');
+            });
+        }
+        
+        function listenToAdminMetrics() {
+            // Live metric for Users
+            onSnapshot(collection(db, USERS_COLLECTION), (snapshot) => {
+                document.getElementById('metric-users').querySelector('span').textContent = snapshot.size;
+            });
+            // Live metric for Classes
+            onSnapshot(collection(db, CLASSES_COLLECTION), (snapshot) => {
+                document.getElementById('metric-classes').querySelector('span').textContent = snapshot.size;
+            });
+            // Live metric for Attendance
+            onSnapshot(collection(db, ATTENDANCE_COLLECTION), (snapshot) => {
+                document.getElementById('metric-attendance').querySelector('span').textContent = snapshot.size;
+            });
+        }
+
+        async function showDataModal(collectionName) {
+            let collectionPath;
+            let title;
+            switch (collectionName) {
+                case 'users':
+                    collectionPath = USERS_COLLECTION;
+                    title = 'All Users Data';
+                    break;
+                case 'classes':
+                    collectionPath = CLASSES_COLLECTION;
+                    title = 'All Classes Data';
+                    break;
+                case 'attendance':
+                    collectionPath = ATTENDANCE_COLLECTION;
+                    title = 'All Attendance Records';
+                    break;
+                default:
+                    return;
+            }
+
+            const dataContent = document.getElementById('data-content');
+            dataContent.textContent = 'Loading...';
+            
+            document.getElementById('data-title').textContent = title;
+            document.getElementById('data-display').classList.remove('hidden');
+
+            try {
+                const querySnapshot = await getDocs(collection(db, collectionPath));
+                const data = [];
+                querySnapshot.forEach(doc => {
+                    data.push({ id: doc.id, ...doc.data() });
+                });
+                dataContent.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                dataContent.textContent = `Error fetching data: ${error.message}`;
+                console.error("Error fetching admin data:", error);
+            }
+        }
+        
+        // ------------------ MAIN RENDERER ------------------
+
+        function renderUI(role) {
+            const container = document.getElementById('app-container');
+            if (role === 'teacher') {
+                renderTeacherUI();
+            } else if (role === 'student') {
+                renderStudentUI();
+            } else if (role === 'admin') {
+                renderAdminUI();
+            } else {
+                displayMessage(`Unknown role: ${role}. Please contact support.`, true);
+            }
+        }
+        
+        // Start the application
+        initFirebase();
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9;
+        }
+        .fixed {
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body class="min-h-screen antialiased">
+
+    <header class="bg-white shadow-md">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+            <h1 class="text-xl font-bold text-gray-900">AMS Dashboard</h1>
+        </div>
+    </header>
+
+    <main id="app-container" class="py-10">
+        <!-- Loading state -->
+        <div class="text-center p-10">
+            <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-indigo-600 mx-auto"></div>
+            <p class="mt-4 text-lg font-medium text-gray-700">Initializing System and Authenticating...</p>
+        </div>
+    </main>
+
+    <!-- Footer for User ID display -->
+    <footer class="fixed bottom-0 left-0 w-full bg-gray-100 p-2 text-center text-xs text-gray-500 border-t">
+        <p>This is a multi-user collaborative application. User ID: <span id="footer-user-id">N/A</span></p>
+    </footer>
+
+</body>
+</html>
