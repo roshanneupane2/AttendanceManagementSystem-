@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>College Attendance Management</title>
+  <style>
+    :root{--bg:#f3f6fb;--card:#fff;--accent:#0f62fe;--muted:#6b7280}
+    *{box-sizing:border-box}
+    body{font-family:Inter, system-ui, Arial, sans-serif;background:var(--bg);margin:0;color:#111}
+    header{background:linear-gradient(90deg,#0f62fe, #2563eb);color:#fff;padding:20px 24px}
+    .wrap{width:95%;max-width:1100px;margin:20px auto}
+    .card{background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 24px rgba(15,23,42,0.06);margin-bottom:16px}
+    h1{margin:0;font-size:20px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    input,select,button{padding:8px 10px;border-radius:8px;border:1px solid #e6e9ef}
+    button{cursor:pointer}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{padding:8px;border-bottom:1px solid #eef2ff;text-align:left}
+    th{background:#f8fbff}
+    .small{font-size:13px;color:var(--muted)}
+    .controls{display:flex;gap:8px;align-items:center}
+    .flex-1{flex:1}
+    .btn-primary{background:var(--accent);color:#fff;border:none}
+    .btn-danger{background:#ef4444;color:#fff;border:none}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#f1f5f9;font-weight:600}
+    .center{text-align:center}
+    .stats{display:flex;gap:12px;flex-wrap:wrap}
+    .stat{flex:1;min-width:140px;padding:12px;border-radius:10px;background:linear-gradient(180deg,#fff,#f8fbff);}
+    @media(max-width:720px){.row{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>College Attendance Management System</h1>
+      <div class="small">Multi-class, per-date attendance, totals & export (uses browser localStorage).</div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card">
+      <h3>Setup</h3>
+      <div class="row" style="align-items:center;margin-top:8px">
+        <input id="class-name" placeholder="Class / Section name (e.g., CS-101)" class="flex-1" />
+        <button class="btn-primary" onclick="addClass()">Add Class</button>
+        <select id="class-select" onchange="loadClass()"></select>
+        <button onclick="deleteClass()" class="btn-danger">Delete Class</button>
+      </div>
+      <div class="small" style="margin-top:8px">Tip: create a class, then add students and mark attendance for dates.</div>
+    </section>
+
+    <section class="card">
+      <h3>Students</h3>
+      <div class="row" style="margin-top:8px">
+        <input id="student-name" placeholder="Student full name (or ID)" class="flex-1" />
+        <input id="student-roll" placeholder="Roll / ID (optional)" style="width:160px" />
+        <button onclick="addStudent()">Add Student</button>
+      </div>
+      <table id="students-table"><thead><tr><th>Name</th><th>Roll</th><th>Actions</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section class="card">
+      <h3>Mark Attendance</h3>
+      <div class="row" style="align-items:center;margin-top:8px">
+        <input type="date" id="att-date" />
+        <button onclick="createDateIfMissing()">Load / Create</button>
+        <div style="flex:1"></div>
+        <button onclick="markAllPresent()">Mark All Present</button>
+        <button onclick="markAllAbsent()">Mark All Absent</button>
+      </div>
+
+      <table id="attendance-table"><thead><tr><th>Student</th><th>Roll</th><th class="center">Status</th><th>Totals</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section class="card">
+      <h3>Totals / Reports</h3>
+      <div class="stats" id="stats"></div>
+      <div style="margin-top:12px" class="row">
+        <button onclick="exportCSV()">Export CSV (class)</button>
+        <button onclick="exportSummaryCSV()">Export Summary CSV</button>
+        <button onclick="clearStorage()" class="btn-danger">Clear All Data</button>
+      </div>
+    </section>
+
+    <section class="card small">
+      <strong>How it works</strong>
+      <ul>
+        <li>Create a class/section.</li>
+        <li>Add students (name + optional roll).</li>
+        <li>Pick a date and click "Load / Create" to create attendance for that date.</li>
+        <li>Click each student's status to toggle Present / Absent / Leave.</li>
+        <li>Totals show present count, total sessions, and percentage per student and class.</li>
+        <li>Everything saved in browser LocalStorage (persist across refresh). Use Export to take data out.</li>
+      </ul>
+    </section>
+  </main>
+
+  <script>
+    // Simple college attendance app using localStorage
+    const STORAGE_KEY = 'college_attendance_v1';
+
+    // App state
+    let data = { classes: {} };
+    let currentClass = null;
+
+    function save() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    }
+    function load() {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) data = JSON.parse(raw);
+      renderClassSelect();
+    }
+
+    function addClass() {
+      const name = document.getElementById('class-name').value.trim();
+      if (!name) return alert('Enter class/section name');
+      if (data.classes[name]) return alert('Class already exists');
+      data.classes[name] = { students: [], dates: {} };
+      save();
+      document.getElementById('class-name').value = '';
+      renderClassSelect();
+      selectClass(name);
+    }
+
+    function renderClassSelect() {
+      const sel = document.getElementById('class-select');
+      sel.innerHTML = '';
+      const empty = document.createElement('option'); empty.value = ''; empty.textContent = '-- Select class --'; sel.appendChild(empty);
+      for (const cname of Object.keys(data.classes)) {
+        const opt = document.createElement('option'); opt.value = cname; opt.textContent = cname; sel.appendChild(opt);
+      }
+      if (currentClass) sel.value = currentClass;
+    }
+
+    function selectClass(name) {
+      currentClass = name;
+      const sel = document.getElementById('class-select'); sel.value = name;
+      loadClass();
+    }
+
+    function loadClass() {
+      const sel = document.getElementById('class-select');
+      const name = sel.value;
+      currentClass = name || null;
+      renderStudents();
+      renderAttendance();
+      renderStats();
+    }
+
+    function deleteClass() {
+      if (!currentClass) return alert('No class selected');
+      if (!confirm('Delete class "' + currentClass + '" and all its data?')) return;
+      delete data.classes[currentClass];
+      currentClass = null;
+      save();
+      renderClassSelect();
+      renderStudents();
+      renderAttendance();
+      renderStats();
+    }
+
+    function addStudent() {
+      if (!currentClass) return alert('Select a class first');
+      const name = document.getElementById('student-name').value.trim();
+      const roll = document.getElementById('student-roll').value.trim();
+      if (!name) return alert('Enter student name');
+      const cls = data.classes[currentClass];
+      const id = Date.now().toString(36);
+      cls.students.push({ id, name, roll });
+      save();
+      document.getElementById('student-name').value = '';
+      document.getElementById('student-roll').value = '';
+      renderStudents();
+      renderAttendance();
+      renderStats();
+    }
+
+    function renderStudents() {
+      const tbody = document.querySelector('#students-table tbody');
+      tbody.innerHTML = '';
+      if (!currentClass) return;
+      const cls = data.classes[currentClass];
+      cls.students.forEach(s => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${escapeHtml(s.name)}</td><td>${escapeHtml(s.roll||'')}</td><td><button onclick="removeStudent('${s.id}')">Remove</button></td>`;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function removeStudent(id) {
+      if (!currentClass) return;
+      if (!confirm('Remove this student?')) return;
+      const cls = data.classes[currentClass];
+      cls.students = cls.students.filter(s=>s.id!==id);
+      // remove attendance entries for student
+      for (const d in cls.dates) {
+        if (cls.dates[d][id]) delete cls.dates[d][id];
+      }
+      save(); renderStudents(); renderAttendance(); renderStats();
+    }
+
+    function createDateIfMissing() {
+      if (!currentClass) return alert('Select a class first');
+      const date = document.getElementById('att-date').value;
+      if (!date) return alert('Choose a date');
+      const cls = data.classes[currentClass];
+      if (!cls.dates[date]) {
+        cls.dates[date] = {};
+      }
+      // initialize as absent
+      cls.students.forEach(s => { if (!cls.dates[date][s.id]) cls.dates[date][s.id] = 'Absent'; });
+      save(); renderAttendance(); renderStats();
+    }
+
+    function renderAttendance() {
+      const tbody = document.querySelector('#attendance-table tbody');
+      tbody.innerHTML = '';
+      if (!currentClass) return;
+      const cls = data.classes[currentClass];
+      const date = document.getElementById('att-date').value;
+      cls.students.forEach(s => {
+        const status = (date && cls.dates[date] && cls.dates[date][s.id]) || 'N/A';
+        const totals = computeTotalsForStudent(cls, s.id);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${escapeHtml(s.name)}</td><td>${escapeHtml(s.roll||'')}</td><td class="center"><button onclick="toggleStatus('${s.id}')">${status}</button></td><td>${totals.present}/${totals.total} (${totals.percent}%)</td>`;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function toggleStatus(studentId) {
+      if (!currentClass) return;
+      const date = document.getElementById('att-date').value;
+      if (!date) return alert('Choose a date and click Load / Create');
+      const cls = data.classes[currentClass];
+      const cur = cls.dates[date][studentId] || 'Absent';
+      const next = cur === 'Present' ? 'Leave' : cur === 'Leave' ? 'Absent' : 'Present';
+      cls.dates[date][studentId] = next;
+      save(); renderAttendance(); renderStats();
+    }
+
+    function markAllPresent() {
+      if (!currentClass) return;
+      const date = document.getElementById('att-date').value; if (!date) return alert('Choose date');
+      const cls = data.classes[currentClass];
+      cls.students.forEach(s=> cls.dates[date][s.id] = 'Present');
+      save(); renderAttendance(); renderStats();
+    }
+    function markAllAbsent() {
+      if (!currentClass) return;
+      const date = document.getElementById('att-date').value; if (!date) return alert('Choose date');
+      const cls = data.classes[currentClass];
+      cls.students.forEach(s=> cls.dates[date][s.id] = 'Absent');
+      save(); renderAttendance(); renderStats();
+    }
+
+    function computeTotalsForStudent(cls, studentId) {
+      let total = 0, present = 0, leave = 0;
+      for (const d in cls.dates) {
+        const s = cls.dates[d][studentId];
+        if (s) { total++; if (s === 'Present') present++; if (s === 'Leave') leave++; }
+      }
+      const percent = total ? Math.round((present/total)*100) : 0;
+      return { total, present, leave, percent };
+    }
+
+    function renderStats() {
+      const container = document.getElementById('stats'); container.innerHTML = '';
+      if (!currentClass) return;
+      const cls = data.classes[currentClass];
+      // class-level totals
+      let sessions = Object.keys(cls.dates).length;
+      let totalStudents = cls.students.length;
+      let overallPresent = 0;
+      // average percent
+      let sumPercent = 0;
+      cls.students.forEach(s => { const t = computeTotalsForStudent(cls, s.id); overallPresent += t.present; sumPercent += t.percent; });
+      const avgPercent = totalStudents ? Math.round(sumPercent/totalStudents) : 0;
+      container.appendChild(createStat('Sessions', sessions));
+      container.appendChild(createStat('Students', totalStudents));
+      container.appendChild(createStat('Total Presents', overallPresent));
+      container.appendChild(createStat('Average %', avgPercent + '%'));
+    }
+
+    function createStat(title, value) {
+      const div = document.createElement('div'); div.className='stat'; div.innerHTML = `<div class="small">${escapeHtml(title)}</div><div style="font-weight:700;margin-top:6px">${escapeHtml(String(value))}</div>`; return div;
+    }
+
+    function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    function exportCSV(){
+      if (!currentClass) return alert('Select a class');
+      const cls = data.classes[currentClass];
+      const rows = [];
+      // header: Name,Roll, for each date, Totals
+      const dates = Object.keys(cls.dates).sort();
+      const header = ['Name','Roll',...dates,'TotalPresent','TotalSessions','Percent'];
+      rows.push(header);
+      cls.students.forEach(s=>{
+        const totals = computeTotalsForStudent(cls,s.id);
+        const row = [s.name,s.roll||''];
+        dates.forEach(d=> row.push(cls.dates[d] && cls.dates[d][s.id] ? cls.dates[d][s.id] : ''));
+        row.push(totals.present, totals.total, totals.percent + '%');
+        rows.push(row);
+      });
+      downloadCSV(rows, `${currentClass.replace(/[^a-z0-9]/gi,'_')}_attendance.csv`);
+    }
+
+    function exportSummaryCSV(){
+      const rows = [['Class','Students','Sessions','TotalPresents','Average%']];
+      for (const cname in data.classes) {
+        const cls = data.classes[cname];
+        let totalPres=0, sumPercent=0;
+        cls.students.forEach(s=>{ const t=computeTotalsForStudent(cls,s.id); totalPres+=t.present; sumPercent+=t.percent; });
+        const avg = cls.students.length? Math.round(sumPercent/cls.students.length):0;
+        rows.push([cname, cls.students.length, Object.keys(cls.dates).length, totalPres, avg+'%']);
+      }
+      downloadCSV(rows,'attendance_summary.csv');
+    }
+
+    function downloadCSV(rows, filename){
+      const csv = rows.map(r=> r.map(cell=> '"'+String(cell).replace(/"/g,'""')+'"').join(',')).join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }
+
+    function clearStorage(){ if (!confirm('Clear all saved attendance data?')) return; localStorage.removeItem(STORAGE_KEY); data = { classes: {} }; currentClass = null; renderClassSelect(); renderStudents(); renderAttendance(); renderStats(); }
+
+    // init
+    load();
+    // preselect first class if any
+    if (!currentClass && Object.keys(data.classes).length>0) { currentClass = Object.keys(data.classes)[0]; renderClassSelect(); loadClass(); }
+
+  </script>
+</body>
+</html>
